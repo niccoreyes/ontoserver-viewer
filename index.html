@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Ontoserver FHIR Browser</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .search-box { width: 100%; padding: 10px; margin-bottom: 20px; }
+        .result-item {
+            padding: 15px;
+            margin-bottom: 10px;
+            background: #f5f5f5;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        .result-item:hover {
+            background: #ddd;
+        }
+        .expanded { background: #fff; }
+        .code-list { margin-top: 10px; padding-left: 20px; }
+        .code-item { margin: 5px 0; font-family: monospace; }
+        .caret { float: right; }
+        .error { color: red; }
+        .nested-codes { margin-left: 20px; display: none; }
+        .code-header { cursor: pointer; }
+        .code-header:hover { background: #eee; }
+        .region-properties {
+            margin: 10px 0;
+            padding: 10px;
+            background: #f8f8f8;
+            border-radius: 4px;
+        }
+        .property {
+            margin: 5px 0;
+            font-size: 0.9em;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <h1>Ontoserver ValueSet Search</h1>
+    <input type="text" class="search-box" placeholder="Search ValueSets (e.g., 'blood pressure')" id="searchInput">
+    <button onclick="searchValueSets()">Search</button>
+    <div id="results"></div>
+
+    <script>
+        const ONTOSERVER_ENDPOINT = 'https://tx.fhirlab.net/fhir';
+
+        // Add event listeners for enter key and initial load
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('searchInput').addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') searchValueSets();
+            });
+            searchValueSets(); // Auto-search on initial load
+        });
+
+        async function searchValueSets() {
+            const searchTerm = document.getElementById('searchInput').value;
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.innerHTML = 'Loading...';
+
+            try {
+                // Modified URL construction to handle empty search term
+                const url = searchTerm 
+                    ? `${ONTOSERVER_ENDPOINT}/ValueSet?title=${encodeURIComponent(searchTerm)}`
+                    : `${ONTOSERVER_ENDPOINT}/ValueSet`;
+
+                const response = await fetch(url);
+                const data = await response.json();
+                
+                if (data.entry) {
+                    resultsDiv.innerHTML = data.entry.map(entry => `
+                        <div class="result-item" onclick="handleResultItemClick(event, '${entry.resource.id}')">
+                            <span class="caret">▶</span>
+                            <h3>${entry.resource.title}</h3>
+                            <p>URL: ${entry.resource.url}</p>
+                            ${entry.resource.extension?.find(e => e.url === 'http://hl7.org/fhir/StructureDefinition/valueset-description')?.valueMarkdown ? 
+                                `<p>Description: ${entry.resource.extension.find(e => e.url === 'http://hl7.org/fhir/StructureDefinition/valueset-description').valueMarkdown}</p>` : ''}
+                        </div>
+                    `).join('');
+                } else {
+                    resultsDiv.innerHTML = 'No results found';
+                }
+            } catch (error) {
+                resultsDiv.innerHTML = `<div class="error">Error fetching data: ${error.message}</div>`;
+            }
+        }
+
+        async function expandValueSet(valueSetId) {
+            const item = event.currentTarget;
+            if (item.classList.contains('expanded')) {
+                item.classList.remove('expanded');
+                item.querySelector('.code-list').remove();
+                return;
+            }
+
+            try {
+                // Use Ontoserver's endpoint for expansion
+                const response = await fetch(`${ONTOSERVER_ENDPOINT}/ValueSet/${valueSetId}/$expand`, {
+                    headers: {
+                        'Accept': 'application/fhir+json'
+                    }
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                const codes = data.expansion?.contains || [];
+                
+                const codesHtml = renderCodes(codes);
+
+                item.classList.add('expanded');
+                item.insertAdjacentHTML('beforeend', `
+                    <div class="code-list">
+                        <h4>Contains (${codes.length} codes):</h4>
+                        ${codesHtml}
+                    </div>
+                `);
+            } catch (error) {
+                console.error('Error expanding ValueSet:', error);
+                item.insertAdjacentHTML('beforeend', `
+                    <div class="error">Error expanding ValueSet: ${error.message}</div>
+                `);
+            }
+        }
+
+        function renderCodes(codes, level = 0) {
+            return codes.map(code => `
+                <div class="code-item" style="margin-left: ${level * 20}px">
+                    <div class="code-header" onclick="toggleCodeExpansion(event, this, '${code.system}', '${code.code}')">
+                        <span class="caret">▶</span>
+                        ${code.system} | ${code.code} - ${code.display}
+                    </div>
+                    <div class="nested-codes"></div>
+                </div>
+            `).join('');
+        }
+
+        async function toggleCodeExpansion(event, element, system, code) {
+            event.stopPropagation();
+            const container = element.closest('.code-item');
+            const nested = container.querySelector('.nested-codes');
+            
+            if (nested.style.display === 'block') {
+                nested.style.display = 'none';
+                element.querySelector('.caret').textContent = '▶';
+                return;
+            }
+
+            if (!nested.innerHTML.trim()) {
+                try {
+                    // Get code details using CodeSystem lookup
+                    const lookupResponse = await fetch(
+                        `${ONTOSERVER_ENDPOINT}/CodeSystem/$lookup?` +
+                        new URLSearchParams({
+                            system,
+                            code,
+                            property: '*',
+                            _format: 'json'
+                        })
+                    );
+                    
+                    const lookupData = await lookupResponse.json();
+                    
+                    // Extract properties and child codes
+                    const properties = [];
+                    const childCodes = [];
+                    
+                    // Get display name from the main parameters
+                    const display = lookupData.parameter?.find(p => p.name === 'display')?.valueString;
+                    const definition = lookupData.parameter?.find(p => p.name === 'property' && 
+                        p.part?.find(part => part.name === 'code' && part.valueCode === 'definition'))
+                        ?.part?.find(part => part.name === 'value')?.valueString;
+
+                    lookupData.parameter?.forEach(param => {
+                        if (param.name === 'property' && param.part) {
+                            const propCode = param.part.find(p => p.name === 'code')?.valueCode;
+                            const propValue = param.part.find(p => p.name === 'value');
+                            
+                            if (propCode === 'child') {
+                                // For each child code, immediately fetch its details
+                                const childCode = propValue.valueCode;
+                                childCodes.push({
+                                    system,
+                                    code: childCode,
+                                    display: definition || display || childCode // Use definition or display as fallback
+                                });
+                            } else {
+                                properties.push({
+                                    code: propCode,
+                                    value: propValue?.valueString || propValue?.valueCode || propValue?.valueBoolean
+                                });
+                            }
+                        }
+                    });
+
+                    // Fetch display names for all child codes
+                    const childrenWithDisplay = await Promise.all(childCodes.map(async childCode => {
+                        try {
+                            const childResponse = await fetch(
+                                `${ONTOSERVER_ENDPOINT}/CodeSystem/$lookup?` +
+                                new URLSearchParams({
+                                    system: childCode.system,
+                                    code: childCode.code,
+                                    property: '*',
+                                    _format: 'json'
+                                })
+                            );
+                            
+                            const childData = await childResponse.json();
+                            const childDefinition = childData.parameter?.find(p => p.name === 'property' && 
+                                p.part?.find(part => part.name === 'code' && part.valueCode === 'definition'))
+                                ?.part?.find(part => part.name === 'value')?.valueString;
+                            const childDisplay = childData.parameter?.find(p => p.name === 'display')?.valueString;
+                            
+                            return {
+                                ...childCode,
+                                display: childDefinition || childDisplay || childCode.code
+                            };
+                        } catch (error) {
+                            console.error(`Error fetching child code ${childCode.code}:`, error);
+                            return childCode;
+                        }
+                    }));
+
+                    // Build the HTML
+                    const propertiesHtml = properties.map(prop => `
+                        <div class="property">
+                            <strong>${prop.code}:</strong> ${prop.value}
+                        </div>
+                    `).join('');
+
+                    const childCodesHtml = childrenWithDisplay.length > 0 
+                        ? renderCodes(childrenWithDisplay) 
+                        : '<div class="code-item">No child codes found</div>';
+
+                    nested.innerHTML = `
+                        <div class="region-properties">
+                            <h5>Code Properties:</h5>
+                            ${propertiesHtml}
+                        </div>
+                        ${childCodesHtml}
+                    `;
+                } catch (error) {
+                    nested.innerHTML = `<div class="error">Error looking up code: ${error.message}</div>`;
+                }
+            }
+            
+            nested.style.display = 'block';
+            element.querySelector('.caret').textContent = '▼';
+        }
+
+        function countTotalCodes(codes) {
+            return codes.reduce((acc, code) => 
+                acc + 1 + (code.contains ? countTotalCodes(code.contains) : 0), 0);
+        }
+
+        function handleResultItemClick(event, valueSetId) {
+            if (!event.target.closest('.code-header')) {
+                expandValueSet(valueSetId);
+            }
+        }
+    </script>
+</body>
+</html>
